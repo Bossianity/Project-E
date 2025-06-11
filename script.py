@@ -4,22 +4,23 @@ import time
 import random
 import logging
 import requests
+import pandas as pd
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.schema import SystemMessage, HumanMessage, AIMessage
 from flask import Flask, request, jsonify, current_app
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
-# functools is not strictly needed for this implementation as we are not using partial.
-import re # Ensure re is imported
-import tempfile # For handling temporary files if needed
-from openai import OpenAI # For Whisper API
+import re
+import tempfile
+from openai import OpenAI
 from media_handler import download_and_decrypt_media
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 import pytz
 import smtplib
 from email.mime.text import MIMEText
+import property_handler
 
 # Ensure rag_handler.py is in the same directory or accessible via PYTHONPATH
 from rag_handler import (
@@ -63,6 +64,8 @@ load_dotenv()
 OPENAI_API_KEY      = os.getenv('OPENAI_API_KEY')
 WASENDER_API_TOKEN  = os.getenv('WASENDER_API_TOKEN')
 WASENDER_API_URL    = "https://www.wasenderapi.com/api/send-message"
+PROPERTY_SHEET_ID   = os.getenv('PROPERTY_SHEET_ID')
+PROPERTY_SHEET_NAME = os.getenv('PROPERTY_SHEET_NAME', 'Properties')
 
 # --- Global Pause Feature ---
 # These variables are in-memory and will be reset if the Flask app restarts or is redeployed.
@@ -70,62 +73,25 @@ is_globally_paused = False
 paused_conversations = set()
 
 # ─── Persona loading ───────────────────────────────────────────────────────────
-PERSONA_FILE    = 'persona.json' # This remains the same
+PERSONA_FILE    = 'persona.json'
+
+PERSONA_NAME = "Emran"
 
 BASE_PROMPT = (
-    "You are Layla, a super friendly, chatty, adorable, and funny seasoned sales agent."
-    "CRITICAL LANGUAGE RULE: Your response MUST ALWAYS be in the SAME language as the user's last message EXCEPT IN SYSTEM MESSAGES (those between square brackets) SYSTEM MESSAGES MUST BE USED AS THEY ARE UNTRANSLATED AND UNMODIFIED. OTHERWISE If the user messages in English, you MUST reply in English. If they message in Arabic, you MUST reply in Arabic. For example, if the user writes in English, all your responses, including greetings, must be in English."
-    "Failure to adhere to this language rule will result in a poor user experience; it is your top priority to match the user's language."
-    "Following commands and example sentences are given in English but if the client message is in another language then just adapt these commands to the language spoken with. Give warm but not too long responses, nobody likes walls of text. "
-    "YOUR RESPONSES MUST BE GROUNDED ON THE CONTEXT PROVIDED. Do not invent details about prices, services, location, or opening times that are not present in the 'Relevant Information Found'. Strive to answer the user's question as completely as possible using the provided context. If, after carefully reviewing all provided information, the context still does not sufficiently answer the query about a factual aspect of the clinic/centre, then apologize in a cute way, mention that you do not know that specific detail but another staff member will get back to them regarding this as soon as possible. IMPORTANT: In this situation, and only in this situation, you MUST append the exact string `[ACTION_NOTIFY_UNANSWERED_QUERY]` to the very end of your response. This is a special instruction for the system and will not be shown to the user."
-    "Your main goal is to make every client feel welcome and excited about their treatment journey with us! ✨🎉 This includes upselling our products, and replying to clients critism, for example if a client says the price is too much reply like a smart sales agent would and talk about the quality of our services/products and that its cheaper than the other clinics or whatever you feel appropriate. "
-    "Remember, you're talking to the same person if they message from the same number! Use their recent messagees with them to understand what they're saying now. For example, if they've already told you their name, don't ask for it again if you need it for an appointment and keep referring to that person with that name . Be smart and dynamic! 🧠"
-    "These instructions are your guide, not a rigid script! Feel free to rephrase things naturally to keep the conversation flowing and avoid sounding robotic. Your personality is key! Let it shine! 🤩"
-
-    "OPERATING HOURS: get them from the context provided when asked"
-    
-    
-
-    "If it seems like you are starting a new conversation with a user (e.g., new number, or first message during your active hours), "
-    "begin your response with a greeting like this (STRICTLY adapt it to the language of the client's message, as per the CRITICAL LANGUAGE RULE): 'Hey!👋 I'm Layla, your personal virtual assistant from the clinic! 🤖✨ I'm the clinic's custom ChatGPT. I can answer any questions about our clinic services, pricing, timings, location, and so on! What can I help you with today? 😊' "
-    "After this greeting (if applicable), continue with your full Layla persona. Adapt it to the language the client message comes in."
-
-    "Your role during these off-hours is to answer questions about the business (services, pricing, timing, location, etc) and to gather information for appointment requests. Be dynamic and smart in collecting information."
-    "If a user wants to schedule or book an appointment, or mentions dates/times for one: "
-    "Then, politely ask for: their name (only if you dont have it from their previous messages already), their preferred date and time (only if you dont have it from their recent messages already), and the service they are interested in (only if you do not have it from their recent messages already). You can say something like: 'Awesome! 🫡 To get that sorted, could you tell me... ' do not ask about stuff you already have from the recent messages. "
-    "Once the user provides these details, thank them warmly (e.g., 'Perfect! Got all that! 📝') and then clearly state: 'Great, a staff member will reach out to you soon to confirm your booking details! They're super quick! 👍' Ensure you use this phrasing or very similar. Do NOT repeat the details they gave you back to them, just thank them and give this assurance. "
-    "After providing this assurance to the user, if you have successfully gathered the name, preferred date/time, and service interest for an appointment, you MUST append the exact string `[ACTION_SEND_EMAIL_CONFIRMATION]` to the very end of your response. Do not translate this string to arabic or any other language, you must use it as it is. This is a special instruction for the system and will not be shown to the user. For example, if your response is 'Great, a staff member will reach out...', your full output should be 'Great, a staff member will reach out...[ACTION_SEND_EMAIL_CONFIRMATION]'."
-
-    "EMOJI POWER: Use emojis to show off your relatable, adorable and funny side! For example, when a user asks you to do something, a 🫡 is perfect. When you're gathering appointment details, the 📝 emoji fits well. Sprinkle in others like 👋, ✨, 😊, 💖, 🎉, 🤩, 😉, 🤫, 🤖, 🧠, 👍, 📝 where they fit naturally to make the chat feel warm, personal, and lively. "
-    
-    "TEXT STYLING (CRUCIAL): Absolutely NO asterisks (*) or any other markdown-like syntax (e.g., underscores for italics) should be used in your responses to emphasize or highlight words. This means you should not output text like *this* or _this_. Instead, rely on your friendly tone, emojis, and clear phrasing to convey importance or excitement. Do not use bolding or italics at all. Before sending your response, perform a final check to ensure NO asterisks are present. If you find any, remove them. This is a critical instruction."
-
-    "Always be looking for opportunities to highlight our amazing offers and frame our services in a way that is appealing and shows the client the incredible benefits. "
-
-    "LANGUAGE & DIALECT (Reminder: CRITICAL LANGUAGE RULE applies first): Assist the client in any language or dialect they decide to speak to you in. "
-    "If the client switches to Arabic, you switch too! And not just any Arabic – go full Emarati dialect! 🇦🇪 Think fun, friendly, and maybe a little bit cheeky with local slang and informal words (e.g., 'هلا والله!', 'فديتك', 'ما شاء الله عليك', 'أمورك طيبة؟', 'من عيوني الثنتين!'), try to show variation and not repeat the same phrase over and over. Also make sure these phrases are appropriately placed and do not use them where they are not typically used. Shower them with compliments (in a nice way!) and be super polite, but keep it light and engaging. Make it the most enjoyable Emarati chat they've ever had! 😉 Example: Instead of just 'okay', try 'أبشر/أبشري !'. "
-
-    "EMAIL DETAIL FORMATTING: When you pass on appointment details for an *email confirmation* (this is about the data you provide to another system, not necessarily how you chat about it), make sure the date and time are super clear and standardized. For example, instead of 'tmw 5pm', it should be formatted like 'July 26th, 2024, at 5:00 PM'. "
-
-    "HANDLING RETRIEVED INFORMATION (RAG CONTEXT): When 'Relevant Information Found' is provided from our documents (RAG context), you MUST carefully review ALL the provided text snippets. Synthesize this information to formulate a comprehensive answer to the user's inquiries. If different snippets provide different pieces of information (e.g., multiple types of a product, or various details about a service), try to combine these details into your answer. Do your best to answer fully using the provided snippets. Only if, after careful review of all provided information, the question cannot be answered, should you then state that the specific detail is not available and that you will leave it to a human colleague. CRITICALLY IMPORTANT: If the retrieved information from these documents contains any markdown-like styling (e.g., asterisks for bolding like *this word*, or underscores like _this word_), you MUST rephrase or integrate this information into your answer WITHOUT using those styling characters. Your final response must strictly adhere to the 'TEXT STYLING' rule above and avoid all such markdown. Your goal is to provide a clean, natural language response based on the information, not to reproduce its original formatting. Do not cite the source document. "
-    
-    "If a response must exceed two lines, segment it into distinct messages using a newline, ensuring each segment is no more than two lines. Each newline signifies a new WhatsApp message. "
-    "Maintain your chatty, friendly, helpful, adorable, and funny Layla persona throughout the conversation. 😊💖✨"
-
-    """IMAGE SENDING TASK:
-If, AND ONLY IF, you find a specific 'IMAGE_ENTRY' in the 'Relevant Information Found' section that is highly relevant to the user's current query, you MUST respond with the following STRICT 3-line format:
-[ACTION_SEND_IMAGE_VIA_URL]
-The_ImageURL_from_the_IMAGE_ENTRY
-The_Caption_from_the_IMAGE_ENTRY
-
-CRITICAL: When you use this 3-line format for sending an image, NO other text, greeting, or pleasantries should precede or follow this 3-line block.
-IMPORTANT: If there is NO 'IMAGE_ENTRY' in the 'Relevant Information Found' that directly answers the user's query, or if the query is not suitable for an image response (e.g., asking for a phone number), DO NOT use this image format. In such cases, respond normally according to other instructions and available text-based information. DO NOT invent image URLs or captions.
-If you are not sending an image, respond as usual according to other instructions."""
+    "You are Emran, a seasoned real estate sales agent. Your tone is professional, convincing, and direct. You are a businessman focused on closing deals and providing accurate information. Your responses are clear, concise, and to the point. You do not use emojis or other informalities."
+    "CRITICAL LANGUAGE RULE: Your response MUST ALWAYS be in the SAME language as the user's last message. If the user messages in English, you reply in English. If they message in Arabic, you MUST reply in Emirati dialect."
+    "Failure to adhere to this language rule is a critical failure."
+    "YOUR RESPONSES MUST BE GROUNDED ON THE CONTEXT PROVIDED. Do not invent details about properties (prices, features, availability) that are not present in the 'Relevant Information Found'. Your goal is to answer the user's query using the provided context. If the context does not sufficiently answer the query about a factual aspect of a property, state that you will check for that specific detail and get back to them. In this situation, append the exact string `[ACTION_NOTIFY_UNANSWERED_QUERY]` to the end of your response."
+    "You should be persuasive and look for opportunities to upsell or highlight the value of a property, but without sounding needy. You are an expert, not just a salesperson."
+    "You understand context from recent messages. If a user has provided information, do not ask for it again."
+    "When starting a new conversation, begin with a direct greeting: 'This is Emran from [Your Business Name]. How may I assist you with your property inquiry?' Adapt this to the user's language."
+    "If a user wants to schedule a viewing, gather the necessary details: their full name, preferred date and time, and the property of interest (if not already clear). Once you have these details, confirm by stating: 'Thank you. I have your details. A member of our team will contact you shortly to confirm your viewing appointment.' Then, append the exact string `[ACTION_SEND_EMAIL_CONFIRMATION]` to the very end of your response."
+    "TEXT STYLING (CRUCIAL): Absolutely NO emojis, asterisks (*), or any other markdown syntax should be used. Your responses must be plain text. Perform a final check to ensure no such characters are present before sending."
+    "LANGUAGE & DIALECT: Assist the client in any language. If the client uses Arabic, you MUST switch to a professional Emirati dialect (e.g., 'مرحباً، وياك عمران بخصوص العقارات', 'البيانات المطلوبة هي', 'سيتم التواصل معاك قريباً')."
+    "HANDLING RETRIEVED INFORMATION (RAG CONTEXT): When 'Relevant Information Found' is provided, you MUST carefully review all snippets. Synthesize the information to formulate a comprehensive and direct answer. Do not reproduce the original formatting of the source data. Your final response must be clean, natural language."
+    "END OF CONVERSATION: You do not always need to end with a question or an offer for more help. Sometimes, simply providing the answer is sufficient. Be efficient."
+    "IMAGE SENDING TASK: If an 'IMAGE_ENTRY' in the 'Relevant Information Found' is relevant to the user's query, you MUST respond with the strict 3-line format: \n[ACTION_SEND_IMAGE_VIA_URL]\nThe_ImageURL_from_the_IMAGE_ENTRY\nThe_Caption_from_the_IMAGE_ENTRY\nWhen you use this format, no other text should precede or follow it."
 )
-
-PERSONA_NAME    = "Layla" # Set Layla as the default name
-PERSONA_DESC    = BASE_PROMPT
-
 
 try:
     with open(PERSONA_FILE) as f:
@@ -652,190 +618,172 @@ def extract_appointment_details_for_email(conversation_history_str):
 
 # ─── Generate response from LLM with RAG and Scheduling ─────────────────────
 def get_llm_response(text, sender_id, history_dicts=None, retries=3):
-    if not AI_MODEL: 
-        return {'type': 'text', 'content': "🚨 AI Model not configured."}
+    if not AI_MODEL:
+        return {'type': 'text', 'content': "AI Model not configured."}
 
-    # RAG Context Retrieval
-    if 'current_app' in globals() and current_app: 
-        vector_store = current_app.config.get('VECTOR_STORE')
-        embeddings = current_app.config.get('EMBEDDINGS')
-    else: 
-        vector_store = vector_store_rag
-        embeddings = embeddings_rag
-        if not vector_store or not embeddings:
-            logging.warning("RAG components not found (current_app or global). Context retrieval will be skipped.")
+    # --- Step 1: Intent and Filter Extraction ---
+    analysis_prompt = f"""
+    Analyze the user's request: '{text}'
+    Determine if this is a query for properties with specific filters (price, location, bedrooms, type, etc.) or a general question.
 
-    # Determine if RAG query should be skipped
-    skip_rag_query = False
-    common_conversational_phrases = [
-        "hi", "hello", "thanks", "ok", "yes", "no", "bye", "thank you", "okey", "okay", "sure", "cool",
-        "مرحبا", "اهلا", "شكرا", "نعم", "لا", "وداعا", "تمام", "اوك", "أوك", "اكيد"
-    ]
-    normalized_text = text.lower().strip()
-    if normalized_text in common_conversational_phrases or len(normalized_text) < 4:
-        skip_rag_query = True
-        logging.info(f"Skipping RAG query for short/common phrase: '{text}'")
+    Respond with a JSON object with two keys: "intent" and "filters".
+    - "intent" can be "property_search" or "general_question".
+    - "filters" should be a dictionary of criteria if it's a property search, otherwise null.
 
+    Supported filter keys are: `Price_AED`, `Bedrooms`, `emirate`, `city`, `area`, `developer`, `Title`.
+    For numeric keys (`Price_AED`, `Bedrooms`), the operator can be '<', '>', or '='.
+
+    Example 1: "show me properties below 1 million aed in dubai"
+    {{
+      "intent": "property_search",
+      "filters": {{
+        "Price_AED": {{ "operator": "<", "value": 1000000 }},
+        "city": {{ "operator": "=", "value": "dubai" }}
+      }}
+    }}
+
+    Example 2: "do you have 3 bedroom villas"
+    {{
+      "intent": "property_search",
+      "filters": {{
+        "Bedrooms": {{ "operator": "=", "value": 3 }},
+        "Title": {{ "operator": "=", "value": "villa" }}
+      }}
+    }}
+
+    Example 3: "what is your commission?"
+    {{
+      "intent": "general_question",
+      "filters": null
+    }}
+
+    Respond with ONLY the JSON object.
+    """
+
+    try:
+        analysis_response = AI_MODEL.invoke([HumanMessage(content=analysis_prompt)])
+        response_text = analysis_response.content.strip()
+        if response_text.startswith('```json'):
+            response_text = response_text[len('```json'):].strip()
+        if response_text.endswith('```'):
+            response_text = response_text[:-len('```')].strip()
+
+        analysis_json = json.loads(response_text)
+        intent = analysis_json.get("intent")
+        filters = analysis_json.get("filters")
+        logging.info(f"Query analysis complete. Intent: '{intent}', Filters: {filters}")
+    except Exception as e:
+        logging.error(f"Failed to analyze user query with LLM: {e}. Defaulting to general question.")
+        intent = "general_question"
+        filters = None
+
+    # --- Step 2: Execute Logic Based on Intent ---
     context_str = ""
-    # Removed history_context_for_rag logic as per subtask
-    # history_context_for_rag = ""
-    # if history_dicts:
-    #     # Iterate through the last 4 messages (2 turns of conversation)
-    #     for message_dict in history_dicts[-4:]:
-    #         if message_dict.get("parts") and isinstance(message_dict["parts"], list):
-    #             content = message_dict["parts"][0]
-    #             if isinstance(content, str):
-    #                 history_context_for_rag += content + " "
-    # logging.info(f"Constructed history_context_for_rag: '{history_context_for_rag}'")
+    if intent == "property_search" and PROPERTY_SHEET_ID:
+        # --- Structured Property Search Logic ---
+        all_properties_df = property_handler.get_sheet_data()
+        if not all_properties_df.empty:
+            filtered_df = property_handler.filter_properties(all_properties_df, filters)
 
-    if not skip_rag_query and vector_store and embeddings:
-        # RAG query now uses only the current 'text'
-        logging.info(f"Querying vector store for context related to user's current message: {text[:200]}...")
-        retrieved_docs = query_vector_store(text, vector_store, k=5)
-        if retrieved_docs:
-            # Programmatically strip asterisks from RAG content before adding to prompt
-            # This is a more robust way to handle asterisks from RAG than relying solely on the prompt
-            processed_docs_content = []
-            for doc in retrieved_docs:
-                content = doc.page_content
-                # Enhanced removal of asterisks from RAG content
-                # Attempt to remove markdown-like asterisks more broadly
-                # Remove *word* or **word** etc. including cases with spaces like * word *
-                content = re.sub(r'\*+\s*(.*?)\s*\*+', r'\1', content)
-                # Remove any remaining standalone or improperly paired asterisks next to word characters.
-                # Example: "*juvederm" becomes "juvederm"
-                content = re.sub(r'\*(\w)', r'\1', content) # Leading asterisk: *word -> word
-                content = re.sub(r'(\w)\*', r'\1', content) # Trailing asterisk: word* -> word
-                # The underscore removal can remain as is:
-                content = re.sub(r'_([^_]+)_', r'\1', content) # _word_ -> word
-                processed_docs_content.append(content)
-            context_str = "\n\nRelevant Information Found:\n" + "\n".join(processed_docs_content)
-            logging.info(f"Context retrieved (asterisks stripped): {context_str[:200]}...")
-        else: logging.info("No relevant context found in vector store.")
-    else: logging.info("Vector store or embeddings not available; skipping context retrieval.")
-    
-    final_prompt_to_llm = context_str + "\n\nUser Question: " + text if context_str else text
-    
-    messages = [SystemMessage(content=PERSONA_DESC)]
+            if not filtered_df.empty:
+                context_str = "Relevant Information Found:\n"
+                for _, prop in filtered_df.head(5).iterrows():
+                    prop_details = (
+                        f"Title: {prop['Title']}\n"
+                        f"Location: {prop['area']}, {prop['city']}, {prop['emirate']}\n"
+                        f"Price: {prop['Price_AED']} AED\n"
+                        f"Bedrooms: {prop['Bedrooms']}\n"
+                        f"Description: {prop['Description']}\n"
+                    )
+                    context_str += prop_details
+                    for img_col in ['img1', 'img2', 'img3']:
+                        if prop[img_col] and isinstance(prop[img_col], str) and prop[img_col].startswith('http'):
+                            context_str += f"[ACTION_SEND_IMAGE_VIA_URL]\n{prop[img_col]}\n{prop['Title']}\n"
+                    context_str += "---\n"
+            else:
+                context_str = "Relevant Information Found:\nNo properties found matching your specific criteria. I can search again if you adjust your filters."
+        else:
+             context_str = "Relevant Information Found:\nI was unable to access the property listings. Please try again shortly."
+
+    else:
+        # --- Fallback to General RAG (Vector Search) Logic ---
+        logging.info("Performing general RAG query using vector store.")
+        if 'current_app' in globals() and current_app:
+            vector_store = current_app.config.get('VECTOR_STORE')
+        else:
+            vector_store = vector_store_rag
+
+        if vector_store:
+            retrieved_docs = query_vector_store(text, vector_store, k=5)
+            if retrieved_docs:
+                processed_docs_content = [re.sub(r'\*+\s*(.*?)\s*\*+', r'\1', doc.page_content) for doc in retrieved_docs]
+                context_str = "\n\nRelevant Information Found:\n" + "\n".join(processed_docs_content)
+            else:
+                logging.info("No relevant context found in vector store for general query.")
+        else:
+            logging.warning("Vector store not available for general query.")
+
+    # --- Step 3: Generate Final Response Based on Context ---
+    final_prompt_to_llm = context_str + f"\n\nUser Question: {text}" if context_str else text
+
+    messages = [SystemMessage(content=BASE_PROMPT)]
     if history_dicts:
         for item in history_dicts:
             role = item.get('role')
             parts = item.get('parts')
-            if role and parts and isinstance(parts, list) and parts: 
-                content = parts[0] 
+            if role and parts and isinstance(parts, list) and parts:
+                content = parts[0]
                 if role == 'user': messages.append(HumanMessage(content=content))
-                elif role == 'model' or role == 'assistant': messages.append(AIMessage(content=content))
-    
+                elif role in ['model', 'assistant']: messages.append(AIMessage(content=content))
+
     messages.append(HumanMessage(content=final_prompt_to_llm))
-    
+
     for attempt in range(retries):
         try:
-            logging.info(f"Sending to LLM (Attempt {attempt+1}): {final_prompt_to_llm[:200]}…")
+            logging.info(f"Sending to LLM for final response generation (Attempt {attempt+1})")
             resp = AI_MODEL.invoke(messages)
-            raw_llm_output = resp.content # Get the raw output
+            raw_llm_output = resp.content.strip()
 
-            # --- Handle Image Trigger Token (NEW) ---
-            image_trigger_token = "[ACTION_SEND_IMAGE_VIA_URL]"
-            if raw_llm_output.strip().startswith(image_trigger_token):
-                logging.info(f"Image trigger token '{image_trigger_token}' detected in LLM output.")
-                lines = raw_llm_output.strip().split('\n')
-                if len(lines) >= 3:
-                    image_url = lines[1].strip()
-                    image_caption = lines[2].strip()
-                    if image_url.startswith('http://') or image_url.startswith('https://'):
-                        logging.info(f"Parsed image URL: {image_url}, Caption: {image_caption}")
-                        return {'type': 'image', 'url': image_url, 'caption': image_caption}
+            response_text = raw_llm_output
+            final_response_data = {'type': 'text', 'content': response_text}
+
+            if "[ACTION_SEND_IMAGE_VIA_URL]" in response_text:
+                image_parts = []
+                text_parts = []
+                for line in response_text.splitlines():
+                    if line.strip() == "[ACTION_SEND_IMAGE_VIA_URL]":
+                        if image_parts: # new image block starts
+                            # This part is complex, for simplicity, we handle only the FIRST image
+                            pass
+                        image_parts.append(line)
+                    elif image_parts and len(image_parts) < 3:
+                        image_parts.append(line)
                     else:
-                        logging.error(f"Invalid image URL format detected: '{image_url}'. LLM output was: {raw_llm_output.strip()}")
-                        fallback_text = f"I found an image that might be relevant, but I'm having trouble displaying it right now. The description was: {image_caption if image_caption else 'No caption provided.'}"
-                        return {'type': 'text', 'content': fallback_text}
-                else:
-                    logging.error(f"Image trigger token found, but not enough lines for URL/caption. LLM output: {raw_llm_output.strip()}")
-                    fallback_text = "I tried to get an image for you, but there was a formatting issue. Can I help with something else?"
-                    return {'type': 'text', 'content': fallback_text}
-            
-            # If not an image, proceed with normal text processing and other tokens
-            response_text = raw_llm_output.strip()
+                        text_parts.append(line)
 
-            # --- Handle Unanswered Query Notification ---
-            notification_trigger_token = "[ACTION_NOTIFY_UNANSWERED_QUERY]"
-            if notification_trigger_token in response_text: # Check in potentially modified response_text
-                logging.info(f"UNANSWERED_QUERY_DEBUG: Detected notification trigger token: {notification_trigger_token}")
-                response_text = response_text.replace(notification_trigger_token, "").strip() 
-                
-                original_user_query = text
-                cleaned_sender_id = sender_id.split('@')[0] if "@" in sender_id else sender_id
-                
-                notification_message = (
-                    f"Unanswered WhatsApp Query:\n"
-                    f"Asker's Number: {cleaned_sender_id}\n"
-                    f"Question: {original_user_query}"
-                )
-                
-                logging.info(f"UNANSWERED_QUERY_DEBUG: Sending notification: {notification_message}")
-                send_whatsapp_message("971545118190", notification_message)
-            # --- End of Unanswered Query Notification ---
+                if len(image_parts) >= 3:
+                    final_response_data = {'type': 'image', 'url': image_parts[1].strip(), 'caption': image_parts[2].strip()}
+                    # If there's accompanying text, you'd need logic to send it separately.
+                    # For now, we prioritize sending the image.
 
-            email_trigger_token = "[ACTION_SEND_EMAIL_CONFIRMATION]" # Define the token
+            response_text = response_text.replace("[ACTION_NOTIFY_UNANSWERED_QUERY]", "").replace("[ACTION_SEND_EMAIL_CONFIRMATION]", "").strip()
 
-            if email_trigger_token in raw_llm_output: # Check in raw output
-                logging.info(f"EMAIL_TRIGGER_DEBUG: Detected email trigger token: {email_trigger_token}")
-                response_text = response_text.replace(email_trigger_token, "").strip()
+            if response_text:
+                 return {'type': 'text', 'content': response_text}
 
-                # --- Email Trigger Logic ---
-                logging.info("Attempting to extract details for email based on trigger token (after potential image check).")
+            if final_response_data.get('type') == 'image':
+                return final_response_data
 
-                history_snippet_parts = []
-                if history_dicts:
-                    for item in history_dicts[-6:]:
-                        role = item.get('role', 'unknown')
-                        content_parts = item.get('parts', [])
-                        if content_parts and isinstance(content_parts, list) and len(content_parts) > 0:
-                            history_snippet_parts.append(f"{role.capitalize()}: {content_parts[0]}")
-                        elif isinstance(content_parts, str):
-                                history_snippet_parts.append(f"{role.capitalize()}: {content_parts}")
+            logging.warning(f"LLM returned an empty or token-only response on attempt {attempt+1}")
 
-                history_snippet_parts.append(f"User: {text}")
-                # IMPORTANT: Use the MODIFIED response_text (token removed) for the snippet
-                history_snippet_parts.append(f"Assistant (Layla): {response_text}")
-                conversation_snippet = "\n".join(history_snippet_parts)
-                logging.info(f"EMAIL_TRIGGER_DEBUG: Conversation snippet for extraction (token removed):\n{conversation_snippet}")
-
-                extracted_info = extract_appointment_details_for_email(conversation_snippet)
-
-                if extracted_info and \
-                            extracted_info.get("name") and \
-                            extracted_info.get("preferred_datetime") and \
-                            extracted_info.get("service_reason"):
-
-                    clean_sender_id = sender_id.split('@')[0] if "@" in sender_id else sender_id
-
-                    send_appointment_request_email(
-                        user_name=extracted_info.get("name"),
-                        user_phone=clean_sender_id,
-                        preferred_datetime_str=extracted_info.get("preferred_datetime"),
-                        service_reason_str=extracted_info.get("service_reason")
-                    )
-                elif extracted_info:
-                    logging.warning(f"Could not extract all necessary details for email (token triggered). Extracted: {json.dumps(extracted_info, ensure_ascii=False)}. Email not sent.")
-                else:
-                    logging.error("Failed to extract any details for email summary (token triggered). Email not sent.")
-            # --- End of Email Trigger Logic ---
-
-            # This check ensures we still proceed if there was no email trigger but a valid response
-            if response_text: 
-                return {'type': 'text', 'content': response_text}
-            logging.warning(f"LLM returned an empty or token-only response on attempt {attempt+1}") # Log if response_text became empty after token removal
-        
         except Exception as e:
             logging.warning(f"LLM API error on attempt {attempt+1}/{retries}: {e}")
             if attempt + 1 == retries:
                 logging.error("All LLM attempts failed.", exc_info=True)
-                return {'type': 'text', 'content': "Sorry, I'm having trouble connecting right now. Please try again in a moment."}
-            wait_time = (2 ** attempt) + random.uniform(0.1, 0.5)
-            time.sleep(wait_time)
-            
-    return {'type': 'text', 'content': "Sorry, I couldn't generate a response after multiple attempts."}
+                return {'type': 'text', 'content': "I am having trouble processing your request at the moment. Please try again shortly."}
+            time.sleep((2 ** attempt) + random.uniform(0.1, 0.5))
+
+    return {'type': 'text', 'content': "I could not generate a response after multiple attempts."}
 
 # === APPOINTMENT SCHEDULING HANDLER (handle_appointment_scheduling) ===
 # WhatsApp sending functions (send_whatsapp_message, send_whatsapp_image_message)

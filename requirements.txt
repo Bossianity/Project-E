@@ -17,3 +17,6 @@ requests
 tiktoken
 waitress
 cryptography
+pandas
+gspread
+oauth2client
