@@ -147,6 +147,7 @@ def send_whatsapp_options_message(to, text, options):
 
     payload = {
         "to": clean_to,
+        "text": text,  # Required field at root level
         "type": "interactive",
         "interactive": {
             "type": "button",
