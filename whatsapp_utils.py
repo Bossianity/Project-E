@@ -125,3 +125,59 @@ def send_whatsapp_image_message(to, caption, image_url):
 
     logging.error(f"All {max_retries} attempts to send image to {clean_to} failed. URL: {image_url}")
     return False
+
+def send_whatsapp_options_message(to, text, options):
+    """Sends an interactive message with buttons via WaSenderAPI with retry logic."""
+    if not all([WASENDER_API_URL, WASENDER_API_TOKEN, HTTP_SESSION]):
+        logging.error("WASender API URL, Token, or HTTP_SESSION not configured. Cannot send options message.")
+        return False
+
+    clean_to = to.split('@')[0] if "@s.whatsapp.net" in to else to
+    payload = {
+        'to': clean_to,
+        'text': text,
+        'buttons': options
+    }
+    headers = {'Authorization': f'Bearer {WASENDER_API_TOKEN}', 'Content-Type': 'application/json'}
+    max_retries = 4
+
+    for attempt in range(max_retries):
+        try:
+            logging.info(f"Attempting to send options message to {clean_to} (Attempt {attempt+1}/{max_retries}). Text: {text[:50]}...")
+            resp = HTTP_SESSION.post(WASENDER_API_URL, json=payload, headers=headers, timeout=15)
+
+            if not (200 <= resp.status_code < 300):
+                logging.error(f"Error sending options message to {clean_to} on attempt {attempt+1}/{max_retries}. Status: {resp.status_code}. Response: {resp.text[:500]}")
+                if resp.status_code == 401:
+                    logging.error("WASender API Token is unauthorized (401). Cannot send options message.")
+                    return False # No retry for auth error
+                if resp.status_code == 400:
+                    logging.error(f"WASender API returned 400 Bad Request for options message send. Payload: {json.dumps(payload)}, Response: {resp.text[:500]}")
+                # Fall through to retry logic for other non-2xx codes
+
+            else: # Status code is 2xx
+                try:
+                    data = resp.json()
+                    logging.info(f"Options message send API response for {clean_to} (Attempt {attempt+1}): {data.get('message', 'No message field in JSON response')}")
+                    if data.get("success") is True:
+                        logging.info(f"Successfully sent options message to {clean_to}: {text[:50]}...")
+                        return True
+                    else:
+                        logging.warning(f"API call for options message send to {clean_to} (HTTP {resp.status_code}) was successful but 'success' field is false or missing. Attempt {attempt+1}/{max_retries}. JSON: {data}")
+                except requests.exceptions.JSONDecodeError as e_json:
+                    logging.error(f"Failed to decode JSON response for options message send to {clean_to} on attempt {attempt+1}/{max_retries}. Status: {resp.status_code}. Response text: {resp.text[:500]}. Error: {e_json}")
+
+            # If we reach here, it means the attempt failed
+
+        except requests.exceptions.Timeout:
+            logging.warning(f"Options message send attempt {attempt+1}/{max_retries} to {clean_to} timed out after 15 seconds.")
+        except requests.exceptions.RequestException as e_req:
+            logging.warning(f"Options message send attempt {attempt+1}/{max_retries} to {clean_to} failed with RequestException: {e_req}")
+
+        if attempt < max_retries - 1:
+            wait_time = (2 ** attempt) + random.uniform(0.1, 0.9)
+            logging.info(f"Retrying options message send to {clean_to} in {wait_time:.2f} seconds...")
+            time.sleep(wait_time)
+
+    logging.error(f"All {max_retries} attempts to send options message to {clean_to} failed. Text: {text[:50]}...")
+    return False

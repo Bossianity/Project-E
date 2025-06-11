@@ -36,7 +36,7 @@ from google_drive_handler import ( # Added for Google Drive document processing
     get_google_sheet_content
 )
 from outreach_handler import process_outreach_campaign # For outreach feature
-from whatsapp_utils import send_whatsapp_message, send_whatsapp_image_message # For sending WhatsApp messages
+from whatsapp_utils import send_whatsapp_message, send_whatsapp_image_message, send_whatsapp_options_message
 
 # ─── Data Ingestion Configuration ──────────────────────────────────────────────
 COMPANY_DATA_FOLDER = 'company_data'
@@ -1045,10 +1045,18 @@ def webhook():
         body = None
         is_media = False
         media_info = None
-        media_type = None # e.g., "audio", "image", "video"
+        media_type = None
+        is_button_response = False
+        button_id = None
 
         if message_content_dict:
-            if 'conversation' in message_content_dict:
+            # Check for button response
+            if 'buttonsResponseMessage' in message_content_dict:
+                is_button_response = True
+                button_id = message_content_dict['buttonsResponseMessage'].get('selectedButtonId')
+                body = f"Button selected: {button_id}"
+                logging.info(f"Received button response from {sender}: {button_id}")
+            elif 'conversation' in message_content_dict:
                 body = message_content_dict['conversation']
             elif 'extendedTextMessage' in message_content_dict:
                 body = message_content_dict['extendedTextMessage'].get('text')
@@ -1063,15 +1071,12 @@ def webhook():
                 is_media = True
                 media_type = "image"
                 media_info = message_content_dict['imageMessage']
-                # For images, Layla's RAG is expected to find an image and respond with [ACTION_SEND_IMAGE_VIA_URL]
-                # So, we might just set body to a placeholder indicating image received.
                 body = "[User sent an image. Analyzing context...]"
                 logging.info(f"Received image message from {sender}. Body set for RAG analysis.")
             elif 'videoMessage' in message_content_dict:
                 is_media = True
                 media_type = "video"
                 media_info = message_content_dict['videoMessage']
-                # Similar to images, Layla might describe or react based on RAG context.
                 body = "[User sent a video. Analyzing context...]"
                 logging.info(f"Received video message from {sender}. Body set for RAG analysis.")
 
@@ -1083,7 +1088,7 @@ def webhook():
                     logging.error(f"Media message from {sender} is missing URL or mediaKey. MediaInfo: {media_info}")
                     body = "[Media processing error: Missing URL or key]"
                 else:
-                    if media_type in ["audio", "image", "video"]: # Ensure media_type is one of these before decryption
+                    if media_type in ["audio", "image", "video"]:
                         try:
                             logging.info(f"Attempting to download and decrypt {media_type} from {sender}. URL: {media_url[:50]}...")
                             decrypted_media_content = download_and_decrypt_media(media_url, media_key_b64, media_type)
@@ -1113,33 +1118,26 @@ def webhook():
                                     else:
                                         logging.warning("OpenAI client not initialized. Cannot transcribe audio.")
                                         body = "[Audio received, but transcription service is unavailable.]"
-                                # For image/video, body is already set to a placeholder for RAG.
-                                # If specific decrypted content handling for image/video (not RAG based) is needed, add here.
                             else:
                                 logging.error(f"Failed to decrypt {media_type} from {sender}.")
                                 body = f"[{media_type.capitalize()} decryption failed. Please try sending again.]"
-                        except ValueError as ve: # Catch errors from get_decryption_keys for unsupported media types
+                        except ValueError as ve:
                             logging.error(f"Media handling error for {sender} ({media_type}): {ve}")
                             body = f"[Unsupported media type for decryption: {media_type}]"
                         except Exception as e_decrypt:
                             logging.error(f"General error during media download/decryption for {sender} ({media_type}): {e_decrypt}", exc_info=True)
                             body = f"[{media_type.capitalize()} processing failed. Please try sending again.]"
                     else:
-                        # This case should ideally not be reached if media_type is set correctly above.
                         logging.warning(f"Media message from {sender} has an unexpected media_type '{media_type}'. MediaInfo: {media_info}")
                         body = "[Received media of an unexpected type.]"
-            # If 'body' is still None here (e.g. it was not a text message and not a recognized media message),
-            # the check below `if not (sender and body)` will catch it.
 
         if not (sender and body):
-            # This log now correctly reflects that 'body' might be None due to various reasons,
-            # including unrecognized message types or errors in media processing.
             logging.warning(f"Webhook ignored: no sender or body could be processed. Sender: {sender}, Body: {body}, Initial Message Content Dict: {message_content_dict if message_content_dict else 'N/A'}")
             return jsonify(status='ignored: no sender or final body content'), 200
 
         # --- Bot Control Command Handling ---
         normalized_body = body.lower().strip()
-        global is_globally_paused # Needed for reassignment
+        global is_globally_paused
 
         if normalized_body == "bot pause all":
             is_globally_paused = True
@@ -1158,8 +1156,6 @@ def webhook():
             parts = normalized_body.split("bot pause ", 1)
             if len(parts) > 1 and parts[1].strip():
                 target_user_id = parts[1].strip()
-                # Ensure target_user_id is normalized if it's expected to match sender format (e.g. with @s.whatsapp.net)
-                # For now, assuming it's a direct match or an admin will provide the correct format.
                 paused_conversations.add(target_user_id)
                 send_whatsapp_message(sender, f"Bot interactions will be paused for: {target_user_id}")
                 logging.info(f"Bot interactions paused for {target_user_id} by {sender}.")
@@ -1172,7 +1168,7 @@ def webhook():
             parts = normalized_body.split("bot resume ", 1)
             if len(parts) > 1 and parts[1].strip():
                 target_user_id = parts[1].strip()
-                paused_conversations.discard(target_user_id) # Use discard to avoid error if ID not in set
+                paused_conversations.discard(target_user_id)
                 send_whatsapp_message(sender, f"Bot interactions will be resumed for: {target_user_id}")
                 logging.info(f"Bot interactions resumed for {target_user_id} by {sender}.")
             else:
@@ -1182,62 +1178,13 @@ def webhook():
 
         # --- End of Bot Control Command Handling ---
 
-        # --- Outreach Command Handling (NEW) ---
-        is_outreach_command = False
-        original_sheet_specifier = None # Will store the raw input (URL or ID from command/env)
-
-        if normalized_body == "bot start outreach":
-            original_sheet_specifier = os.getenv('DEFAULT_OUTREACH_SHEET_ID')
-            is_outreach_command = True
-            logging.info(f"Outreach command detected. Attempting to use default Sheet specifier: '{original_sheet_specifier}' (if set).")
-        elif normalized_body.startswith("bot start outreach "):
-            parts = normalized_body.split("bot start outreach ", 1)
-            original_sheet_specifier = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
-            is_outreach_command = True
-            if not original_sheet_specifier: # Command was "bot start outreach " (with trailing space but no ID)
-                original_sheet_specifier = os.getenv('DEFAULT_OUTREACH_SHEET_ID')
-                logging.info(f"Outreach command with trailing space detected. Attempting to use default Sheet specifier: '{original_sheet_specifier}' (if set).")
-            else:
-                logging.info(f"Outreach command detected with specific Sheet specifier: '{original_sheet_specifier}'")
-
-        if is_outreach_command:
-            parsed_sheet_id = extract_sheet_id_from_url(original_sheet_specifier)
-
-            if not parsed_sheet_id:
-                error_msg = (
-                    f"Error: No Google Sheet ID or URL was provided, or the provided one ('{original_sheet_specifier}') is invalid. "
-                    "Please specify a valid Google Sheet ID or URL, or ensure DEFAULT_OUTREACH_SHEET_ID is correctly set."
-                )
-                send_whatsapp_message(sender, error_msg)
-                logging.warning(f"Outreach command failed for {sender}: Invalid or missing Sheet specifier ('{original_sheet_specifier}').")
-                return jsonify(status='error_invalid_sheet_specifier'), 200
-
-            agent_sender_id = sender
-            # Use parsed_sheet_id in user-facing messages and for processing
-            send_whatsapp_message(agent_sender_id, f"Outreach campaign started using Sheet ID: {parsed_sheet_id}. You will be notified upon completion.")
-
-            current_app_context = current_app.app_context()
-            try:
-                executor.submit(process_outreach_campaign, parsed_sheet_id, agent_sender_id, current_app_context)
-                logging.info(f"Outreach campaign initiated by {agent_sender_id} for Sheet ID: {parsed_sheet_id} (Original specifier: '{original_sheet_specifier}').")
-                return jsonify(status='outreach_campaign_started'), 200
-            except Exception as e_executor:
-                logging.error(f"Failed to submit outreach campaign to executor for Sheet ID {parsed_sheet_id} (Original specifier: '{original_sheet_specifier}'). Error: {e_executor}", exc_info=True)
-                send_whatsapp_message(agent_sender_id, "Error: Could not start the outreach campaign due to an internal issue.")
-                return jsonify(status='error_starting_outreach_task'), 500
-        # --- End of Outreach Command Handling ---
-
         # --- Check for Pause States (Global or Specific Conversation) ---
         if is_globally_paused:
-            logging.info(f"Bot is globally paused. Ignoring message from {sender}: {body[:100]}...") # Log a snippet of body
+            logging.info(f"Bot is globally paused. Ignoring message from {sender}: {body[:100]}...")
             return jsonify(status='ignored_globally_paused'), 200
 
-        # Ensure 'sender' is used for checking against 'paused_conversations'
-        # 'sender' typically is in the format 'xxxxxxxxxxx@s.whatsapp.net'
-        # 'target_user_id' when added to paused_conversations should match this format or be adapted.
-        # For now, assuming 'sender' is the correct key format for the set.
         if sender in paused_conversations:
-            logging.info(f"Conversation with {sender} is paused. Ignoring message: {body[:100]}...") # Log a snippet of body
+            logging.info(f"Conversation with {sender} is paused. Ignoring message: {body[:100]}...")
             return jsonify(status='ignored_specifically_paused'), 200
 
         # --- End of Pause State Checks ---
@@ -1246,6 +1193,41 @@ def webhook():
         logging.info(f"Incoming from {sender} (UID: {user_id}): {body}")
         
         history = load_history(user_id)
+
+        # Handle button responses
+        if is_button_response:
+            if button_id == "book_appointment":
+                response = "You've chosen to book an appointment. Please tell me your preferred date and time."
+            elif button_id == "inquire_service":
+                response = "You've chosen to inquire about a service. What can I help you with?"
+            else:
+                response = "I'm not sure what you selected. Please try again."
+            
+            send_whatsapp_message(sender, response)
+            new_history_user = {'role': 'user', 'parts': [body]}
+            new_history_model = {'role': 'model', 'parts': [response]}
+            history.append(new_history_user)
+            history.append(new_history_model)
+            save_history(user_id, history)
+            return jsonify(status='success'), 200
+
+        # For new conversations or non-button responses, send the options message
+        options = [
+            {"id": "book_appointment", "text": "Book an Appointment"},
+            {"id": "inquire_service", "text": "Inquire About a Service"}
+        ]
+        
+        if not history:  # This is a new conversation
+            welcome_text = "Hello! How can I assist you today? Please select an option:"
+            if send_whatsapp_options_message(sender, welcome_text, options):
+                new_history_user = {'role': 'user', 'parts': [body]}
+                new_history_model = {'role': 'model', 'parts': [welcome_text]}
+                history.append(new_history_user)
+                history.append(new_history_model)
+                save_history(user_id, history)
+            return jsonify(status='success'), 200
+
+        # For existing conversations, proceed with normal LLM response
         llm_response_data = get_llm_response(body, sender, history)
         
         final_model_response_for_history = ""
@@ -1272,7 +1254,6 @@ def webhook():
                     logging.error(f"Failed to send chunk {idx}/{len(chunks)} to {sender}. Aborting further sends for this message.")
                     break 
                 if idx < len(chunks): 
-                    # MODIFICATION: Increased delay to help prevent messages from arriving out of order.
                     time.sleep(random.uniform(2.0, 3.0))
         else:
             logging.error(f"Unknown response type from get_llm_response: {llm_response_data.get('type')}")
