@@ -133,11 +133,32 @@ def send_whatsapp_options_message(to, text, options):
         return False
 
     clean_to = to.split('@')[0] if "@s.whatsapp.net" in to else to
+    
+    # Convert options to the correct format
+    formatted_buttons = []
+    for option in options:
+        formatted_buttons.append({
+            "type": "reply",
+            "reply": {
+                "id": option["id"],
+                "title": option["text"]
+            }
+        })
+
     payload = {
-        'to': clean_to,
-        'text': text,
-        'buttons': options
+        "to": clean_to,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {
+                "text": text
+            },
+            "action": {
+                "buttons": formatted_buttons
+            }
+        }
     }
+
     headers = {'Authorization': f'Bearer {WASENDER_API_TOKEN}', 'Content-Type': 'application/json'}
     max_retries = 4
 
