@@ -618,7 +618,7 @@ def extract_appointment_details_for_email(conversation_history_str):
 
 # ─── Generate response from LLM with RAG and Scheduling ─────────────────────
 def get_llm_response(text, sender_id, history_dicts=None, retries=3):
-    if not AI_MODEL:
+    if not AI_MODEL: 
         return {'type': 'text', 'content': "AI Model not configured."}
 
     # --- Step 1: Intent and Filter Extraction ---
@@ -708,10 +708,10 @@ def get_llm_response(text, sender_id, history_dicts=None, retries=3):
     else:
         # --- Fallback to General RAG (Vector Search) Logic ---
         logging.info("Performing general RAG query using vector store.")
-        if 'current_app' in globals() and current_app:
-            vector_store = current_app.config.get('VECTOR_STORE')
-        else:
-            vector_store = vector_store_rag
+    if 'current_app' in globals() and current_app: 
+        vector_store = current_app.config.get('VECTOR_STORE')
+    else: 
+        vector_store = vector_store_rag
 
         if vector_store:
             retrieved_docs = query_vector_store(text, vector_store, k=5)
@@ -731,58 +731,56 @@ def get_llm_response(text, sender_id, history_dicts=None, retries=3):
         for item in history_dicts:
             role = item.get('role')
             parts = item.get('parts')
-            if role and parts and isinstance(parts, list) and parts:
-                content = parts[0]
+            if role and parts and isinstance(parts, list) and parts: 
+                content = parts[0] 
                 if role == 'user': messages.append(HumanMessage(content=content))
                 elif role in ['model', 'assistant']: messages.append(AIMessage(content=content))
-
+    
     messages.append(HumanMessage(content=final_prompt_to_llm))
-
+    
     for attempt in range(retries):
         try:
             logging.info(f"Sending to LLM for final response generation (Attempt {attempt+1})")
             resp = AI_MODEL.invoke(messages)
             raw_llm_output = resp.content.strip()
 
-            response_text = raw_llm_output
-            final_response_data = {'type': 'text', 'content': response_text}
+            final_response_data = {'type': 'text', 'content': raw_llm_output} # Default to text
 
-            if "[ACTION_SEND_IMAGE_VIA_URL]" in response_text:
+            # Check for image action and try to parse
+            if "[ACTION_SEND_IMAGE_VIA_URL]" in raw_llm_output:
                 image_parts = []
-                text_parts = []
-                for line in response_text.splitlines():
-                    if line.strip() == "[ACTION_SEND_IMAGE_VIA_URL]":
-                        if image_parts: # new image block starts
-                            # This part is complex, for simplicity, we handle only the FIRST image
-                            pass
+                for line in raw_llm_output.splitlines():
+                    # Collect image related lines only if they are formatted as expected
+                    if line.strip() == "[ACTION_SEND_IMAGE_VIA_URL]" or (image_parts and len(image_parts) < 3):
                         image_parts.append(line)
-                    elif image_parts and len(image_parts) < 3:
-                        image_parts.append(line)
-                    else:
-                        text_parts.append(line)
-
+                
                 if len(image_parts) >= 3:
-                    final_response_data = {'type': 'image', 'url': image_parts[1].strip(), 'caption': image_parts[2].strip()}
-                    # If there's accompanying text, you'd need logic to send it separately.
-                    # For now, we prioritize sending the image.
+                    image_url = image_parts[1].strip()
+                    image_caption = image_parts[2].strip()
+                    if image_url.startswith('http'): # Basic validation for URL
+                        final_response_data = {'type': 'image', 'url': image_url, 'caption': image_caption}
+                        # If an image is successfully parsed, we can return it immediately
+                        return final_response_data
+            
+            # If we reach here, it means either no image action was detected or it was malformed.
+            # Now process the raw_llm_output for text, stripping all action tokens.
+            response_text_for_display = raw_llm_output.replace("[ACTION_NOTIFY_UNANSWERED_QUERY]", "").replace("[ACTION_SEND_EMAIL_CONFIRMATION]", "").strip()
+            response_text_for_display = response_text_for_display.replace("[ACTION_SEND_IMAGE_VIA_URL]", "").strip() # Ensure image token is also removed from text output
+            
+            # If after stripping, there's still meaningful text, return it as a text message
+            if response_text_for_display: 
+                return {'type': 'text', 'content': response_text_for_display}
 
-            response_text = response_text.replace("[ACTION_NOTIFY_UNANSWERED_QUERY]", "").replace("[ACTION_SEND_EMAIL_CONFIRMATION]", "").strip()
-
-            if response_text:
-                 return {'type': 'text', 'content': response_text}
-
-            if final_response_data.get('type') == 'image':
-                return final_response_data
-
+            # If nothing was returned (neither image nor text), log a warning
             logging.warning(f"LLM returned an empty or token-only response on attempt {attempt+1}")
-
+        
         except Exception as e:
             logging.warning(f"LLM API error on attempt {attempt+1}/{retries}: {e}")
             if attempt + 1 == retries:
                 logging.error("All LLM attempts failed.", exc_info=True)
                 return {'type': 'text', 'content': "I am having trouble processing your request at the moment. Please try again shortly."}
             time.sleep((2 ** attempt) + random.uniform(0.1, 0.5))
-
+            
     return {'type': 'text', 'content': "I could not generate a response after multiple attempts."}
 
 # === APPOINTMENT SCHEDULING HANDLER (handle_appointment_scheduling) ===
@@ -796,13 +794,13 @@ def handle_appointment_scheduling(message):
     stores events in New York time, and confirms to user in Dubai time."""
     
     if not CALENDAR_SERVICE: 
-        return "🚨 Sorry, appointment scheduling is currently unavailable. Please contact us directly to book your appointment."
+        return "Sorry, appointment scheduling is currently unavailable. Please contact us directly to book your appointment."
 
     datetime_info = extract_datetime_with_ai(message) 
 
     if not datetime_info or not datetime_info.get('has_datetime'):
         return (
-            "I'd be happy to help you schedule an appointment! 📅\n\n"
+            "I'd be happy to help you schedule an appointment! \n\n"
             "Could you please provide more details? For example:\n"
             "• What date would you prefer?\n"
             "• What time works best for you?\n"
@@ -816,13 +814,13 @@ def handle_appointment_scheduling(message):
         service_type = datetime_info.get('service_type', 'General Consultation')
 
         if not date_str:
-            return "I understand you want to schedule an appointment, but I need a specific date. Could you please tell me which date you prefer? 📅"
+            return "I understand you want to schedule an appointment, but I need a specific date. Could you please tell me which date you prefer?"
 
         appointment_date_dubai_naive = datetime.strptime(date_str, '%Y-%m-%d').date()
 
         if not time_str:
             return (
-                f"Great! I can help you schedule a {service_type} on {appointment_date_dubai_naive.strftime('%A, %B %d, %Y')} ({TARGET_DISPLAY_TIMEZONE.zone} time) 📅\n\n"
+                f"Great! I can help you schedule a {service_type} on {appointment_date_dubai_naive.strftime('%A, %B %d, %Y')} ({TARGET_DISPLAY_TIMEZONE.zone} time) \n\n"
                 "What time would work best for you? For example:\n"
                 "• 9:00 AM\n• 2:00 PM\n• 4:30 PM"
             )
@@ -835,7 +833,7 @@ def handle_appointment_scheduling(message):
 
         current_dubai_time = datetime.now(TARGET_DISPLAY_TIMEZONE)
         if intended_start_dt_dubai_aware < current_dubai_time:
-            return "I can't schedule appointments in the past. Could you please choose a future date and time? 📅"
+            return "I can't schedule appointments in the past. Could you please choose a future date and time?"
 
         event_start_dt_storage_tz_aware = intended_start_dt_dubai_aware.astimezone(EVENT_STORAGE_TIMEZONE)
         event_end_dt_storage_tz_aware = intended_end_dt_dubai_aware.astimezone(EVENT_STORAGE_TIMEZONE)
@@ -848,7 +846,7 @@ def handle_appointment_scheduling(message):
 
         if not check_availability(CALENDAR_SERVICE, event_start_dt_storage_tz_naive, event_end_dt_storage_tz_naive):
             return (
-                f"Unfortunately, {intended_start_dt_dubai_aware.strftime('%A, %B %d at %I:%M %p %Z')} is not available. 😔\n\n"
+                f"Unfortunately, {intended_start_dt_dubai_aware.strftime('%A, %B %d at %I:%M %p %Z')} is not available. \n\n"
                 "Could you please suggest another time? I'd be happy to help you find an alternative slot."
             )
         
@@ -873,12 +871,12 @@ def handle_appointment_scheduling(message):
 
         if created_event_api_response and created_event_api_response.get('htmlLink'):
             return (
-                f"✅ Perfect! Your appointment has been scheduled:\n\n"
-                f"📅 Date: {intended_start_dt_dubai_aware.strftime('%A, %B %d, %Y')}\n"
-                f"🕐 Time: {intended_start_dt_dubai_aware.strftime('%I:%M %p %Z')} ({TARGET_DISPLAY_TIMEZONE.zone})\n"
-                f"⏱️ Duration: {duration} minutes\n"
-                f"🔧 Service: {service_type}\n\n"
-                f"You'll receive a reminder. Looking forward to seeing you! 😊"
+                f"Perfect! Your appointment has been scheduled:\n\n"
+                f"Date: {intended_start_dt_dubai_aware.strftime('%A, %B %d, %Y')}\n"
+                f"Time: {intended_start_dt_dubai_aware.strftime('%I:%M %p %Z')} ({TARGET_DISPLAY_TIMEZONE.zone})\n"
+                f"Duration: {duration} minutes\n"
+                f"Service: {service_type}\n\n"
+                f"You'll receive a reminder. Looking forward to seeing you!"
             )
         else:
             logging.error(f"Failed to create event or event link missing. API Response: {created_event_api_response}")
@@ -1209,7 +1207,7 @@ def webhook():
             else:
                 final_model_response_for_history = f"[Failed to send Image: {image_url} with caption: {caption}]"
                 logging.error(f"Failed to send image to {sender}. URL: {image_url}")
-                fallback_message = "I tried to send you an image, but it seems there was a problem. Please try again later or ask me something else! 😊"
+                fallback_message = "I tried to send you an image, but it seems there was a problem. Please try again later or ask me something else!"
                 send_whatsapp_message(sender, fallback_message)
         elif llm_response_data['type'] == 'text':
             text_content = llm_response_data['content']
