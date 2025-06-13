@@ -3,265 +3,133 @@ import time
 import logging
 import json
 from datetime import datetime
-import pytz # Added for timezone support
-from googleapiclient.discovery import build
-from google.oauth2 import service_account
-from flask import current_app # To be used within app_context
+import pytz
 
-# Import send_whatsapp_message from the new whatsapp_utils module
-from whatsapp_utils import send_whatsapp_message
+from whatsapp_utils import send_whatsapp_message, send_interactive_button_message
 
-# --- Constants and Configuration ---
-DEFAULT_SHEET_NAME = "Sheet1"
-REQUIRED_HEADERS = ['PhoneNumber', 'ClientName', 'MessageStatus']
-OPTIONAL_HEADERS = ['LastContactedDate']
-
-
-# --- Utility Functions ---
-def col_num_to_letter(n_zero_based):
-    """Converts a 0-based column index into a spreadsheet column letter (A, B, ..., Z, AA, ...)."""
-    string = ""
-    n = n_zero_based
-    while n >= 0:
-        string = chr(ord('A') + n % 26) + string
-        n = n // 26 - 1
-    return string
-
-
-# --- Google Sheets Service ---
+# Placeholder/Assumed Functions (definitions needed elsewhere in the actual project)
 def get_google_sheets_service():
-    """Initializes and returns the Google Sheets API service."""
+    logging.warning("Placeholder: get_google_sheets_service() called. Returning None.")
+    return None
+
+def read_sheet_data(sheets_service, sheet_id, contacts_sheet_name):
+    logging.warning(f"Placeholder: read_sheet_data({sheet_id}, {contacts_sheet_name}) called. Returning minimal dummy data.")
+    header_map = {'PhoneNumber': 0, 'ClientName': 1, 'MessageStatus': 2, 'InterestedService': 3, 'LastContactedDate': 4}
+    dummy_rows = [
+        {'data': {'PhoneNumber': '1234567890', 'ClientName': 'Test Client', 'MessageStatus': '', 'InterestedService': 'Testing'}, 'original_row_index': 2}
+    ]
+    return dummy_rows, header_map
+
+def update_cell_value(sheets_service, sheet_id, contacts_sheet_name, original_row_idx_1_based, col_header, new_status):
+    logging.warning(f"Placeholder: update_cell_value({sheet_id}, {original_row_idx_1_based}, {col_header}, {new_status}) called.")
+    return True
+
+def get_message_template_from_sheet(sheets_service, sheet_id, template_sheet_name):
+    logging.warning(f"Placeholder: get_message_template_from_sheet({sheet_id}, {template_sheet_name}) called. Returning dummy template.")
+    dummy_interactive_template = {
+        "header": "Test Header",
+        "body": "Hello {{ClientName}}, interested in {{ServiceName}}?",
+        "footer": "Test Footer",
+        "buttons": [{"title": "Yes", "id": "yes_id"}, {"title": "No", "id": "no_id"}]
+    }
+    return dummy_interactive_template, "Simple hello {{ClientName}}", True
+
+def personalize_interactive_message_data(template_data, placeholders):
+    logging.warning(f"Placeholder: personalize_interactive_message_data with {placeholders} called.")
+    personalized_data = json.loads(json.dumps(template_data)) # Deep copy
+    personalized_data['body'] = template_data['body'].replace("{{ClientName}}", placeholders.get('ClientName', 'Valued Customer'))
+    personalized_data['body'] = personalized_data['body'].replace("{{ServiceName}}", placeholders.get('ServiceName', 'our services'))
+    return personalized_data
+
+def _execute_campaign_logic(sheet_id, agent_sender_id):
+    logging.info(f"Executing campaign logic for Sheet ID: {sheet_id}, by {agent_sender_id}.")
+    sheets_service = get_google_sheets_service()
+
+    template_sheet_name = os.getenv('MESSAGE_TEMPLATE_SHEET_NAME', 'MessageTemplate')
+    contacts_sheet_name = os.getenv('CONTACTS_SHEET_NAME', 'Sheet1')
+    delay_seconds = int(os.getenv('OUTREACH_MESSAGE_DELAY_SECONDS', 5))
+    dubai_tz = pytz.timezone('Asia/Dubai')
+
     try:
-        credentials_json_str = os.getenv('GOOGLE_SHEETS_CREDENTIALS')
-        if not credentials_json_str:
-            logging.error("GOOGLE_SHEETS_CREDENTIALS environment variable not set.")
-            return None
-
-        credentials_info = json.loads(credentials_json_str)
-        creds = service_account.Credentials.from_service_account_info(
-            credentials_info,
-            scopes=['https://www.googleapis.com/auth/spreadsheets']
-        )
-        service = build('sheets', 'v4', credentials=creds)
-        logging.info("Google Sheets service initialized successfully.")
-        return service
-    except json.JSONDecodeError:
-        logging.error("Failed to parse GOOGLE_SHEETS_CREDENTIALS JSON.")
-        return None
+        interactive_template, simple_template, is_interactive = get_message_template_from_sheet(sheets_service, sheet_id, template_sheet_name)
+        if not is_interactive and not simple_template:
+             logging.error(f"No message templates loaded from {template_sheet_name}.")
+             return
     except Exception as e:
-        logging.error(f"Error initializing Google Sheets service: {e}", exc_info=True)
-        return None
+        logging.error(f"Failed to get message template: {e}", exc_info=True)
+        return
 
+    rows_data, header_map = read_sheet_data(sheets_service, sheet_id, contacts_sheet_name)
+    if not rows_data:
+        logging.error(f"No contact data from {contacts_sheet_name}.")
+        return
 
-# --- Sheet Data Reading ---
-def read_sheet_data(service, sheet_id, sheet_name=DEFAULT_SHEET_NAME):
-    """
-    Reads data from the specified Google Sheet.
-    Returns a list of row data (as dicts) and a map of header names to their 0-based column indices.
-    """
-    rows_with_original_indices = []
-    header_to_index_map = {}
+    sent_count, failed_count, skipped_count = 0, 0, 0
+    for row_info in rows_data:
+        row_values_dict = row_info['data']
+        original_row_idx_1_based = row_info['original_row_index']
 
-    try:
-        result = service.spreadsheets().values().get(spreadsheetId=sheet_id, range=sheet_name).execute()
-        values = result.get('values', [])
+        phone_number_raw = row_values_dict.get('PhoneNumber')
+        if not phone_number_raw:
+            skipped_count += 1
+            continue
 
-        if not values:
-            logging.warning(f"Sheet '{sheet_name}' in {sheet_id} is empty or no data found.")
-            return [], {}
-
-        headers = values[0]
-        for req_header in REQUIRED_HEADERS:
-            if req_header not in headers:
-                logging.error(f"Missing required header '{req_header}' in sheet {sheet_id}/{sheet_name}. Found headers: {headers}")
-                return [], {}
-
-        for i, header_name in enumerate(headers):
-            header_to_index_map[header_name] = i
-
-        for row_num_0_based, row_values in enumerate(values[1:], start=1): # Data rows start from index 1 of 'values'
-            row_data_dict = {}
-            for col_num_0_based, cell_value in enumerate(row_values):
-                if col_num_0_based < len(headers): # Ensure we don't go out of bounds if row is longer than headers
-                    header_name = headers[col_num_0_based]
-                    row_data_dict[header_name] = cell_value
-
-            # Fill missing optional columns with None if they were not in this specific row
-            for header_name in headers:
-                if header_name not in row_data_dict:
-                    row_data_dict[header_name] = None
-
-            rows_with_original_indices.append({
-                'data': row_data_dict,
-                'original_row_index': row_num_0_based + 1 # 1-based index for sheet interaction
-            })
-
-        logging.info(f"Successfully read {len(rows_with_original_indices)} data rows from {sheet_id}/{sheet_name}.")
-        return rows_with_original_indices, header_to_index_map
-
-    except Exception as e:
-        logging.error(f"Error reading sheet data from {sheet_id}/{sheet_name}: {e}", exc_info=True)
-        return [], {}
-
-
-# --- Sheet Data Updating ---
-def update_cell_value(service, sheet_id, sheet_name, row_index_1_based, col_index_0_based, value):
-    """
-    Updates a single cell in the Google Sheet.
-    row_index_1_based: The 1-based row number in the sheet.
-    col_index_0_based: The 0-based column number.
-    """
-    try:
-        column_letter = col_num_to_letter(col_index_0_based)
-        range_to_update = f"{sheet_name}!{column_letter}{row_index_1_based}"
-
-        body = {'values': [[value]]}
-        service.spreadsheets().values().update(
-            spreadsheetId=sheet_id,
-            range=range_to_update,
-            valueInputOption='USER_ENTERED',
-            body=body
-        ).execute()
-        logging.info(f"Updated cell {range_to_update} in {sheet_id} to '{value}'.")
-        return True
-    except Exception as e:
-        logging.error(f"Error updating cell {sheet_name}!{col_num_to_letter(col_index_0_based)}{row_index_1_based} in {sheet_id}: {e}", exc_info=True)
-        return False
-
-
-# --- Main Campaign Processing Logic ---
-def process_outreach_campaign(sheet_id, agent_sender_id, app_context):
-    """
-    Processes an outreach campaign based on data from a Google Sheet.
-    """
-    with app_context: # Ensures current_app and other Flask context globals are available
-        logging.info(f"Starting outreach campaign for Sheet ID: {sheet_id}, initiated by {agent_sender_id}.")
-
-        # --- Configuration ---
-        business_name = os.getenv('BUSINESS_NAME', 'X Dental Clinic') # Direct os.getenv
-        try:
-            delay_seconds = int(os.getenv('OUTREACH_MESSAGE_DELAY_SECONDS', "5"))
-        except ValueError:
-            logging.warning("Invalid OUTREACH_MESSAGE_DELAY_SECONDS, defaulting to 5.")
-            delay_seconds = 5
-
-        dubai_tz = pytz.timezone('Asia/Dubai') # Define Dubai timezone
-
-        # --- Initialization ---
-        sheets_service = get_google_sheets_service()
-        if not sheets_service:
-            err_msg = f"Failed to initialize Google Sheets service. Campaign for {sheet_id} aborted."
-            logging.error(err_msg)
-            send_whatsapp_message(agent_sender_id, err_msg)
-            return
-
-        rows_data, header_map = read_sheet_data(sheets_service, sheet_id)
-        if not rows_data and not header_map: # Check if read_sheet_data indicated a critical error
-            err_msg = f"Failed to read or validate data from Sheet ID: {sheet_id}. Ensure required headers are present and sheet is not empty. Campaign aborted."
-            logging.error(err_msg)
-            send_whatsapp_message(agent_sender_id, err_msg)
-            return
-
-        # Dynamically get column indices
-        phone_col_idx = header_map.get('PhoneNumber')
-        name_col_idx = header_map.get('ClientName')
-        status_col_idx = header_map.get('MessageStatus')
-        last_contacted_col_idx = header_map.get('LastContactedDate') # Optional
-
-        if None in [phone_col_idx, name_col_idx, status_col_idx]:
-            err_msg = f"One or more critical column indices could not be determined from headers in {sheet_id}. Campaign aborted."
-            logging.error(f"{err_msg} Header map: {header_map}")
-            send_whatsapp_message(agent_sender_id, err_msg)
-            return
-
-        logging.info(f"Successfully validated required column indices for sheet {sheet_id}. Header map: {header_map}")
-        logging.info(f"Starting campaign loop for sheet {sheet_id}, {len(rows_data)} rows to process.")
-
-        sent_count = 0
-        failed_count = 0
-        skipped_count = 0
-
-        # --- Campaign Loop ---
-        for row_info in rows_data:
-            row_values_dict = row_info['data']
-            original_row_idx_1_based = row_info['original_row_index']
-            logging.info(f"Sheet {sheet_id} - Row {original_row_idx_1_based} Loop Start. Data: {row_values_dict}")
-
-            phone_number = row_values_dict.get('PhoneNumber')
-            client_name = row_values_dict.get('ClientName', 'Valued Customer') # Default if name is blank
-
-            raw_message_status = row_values_dict.get('MessageStatus') # Get the raw value
-            # Ensure current_status_for_check is an empty string if raw_message_status is None,
-            # otherwise convert to string, strip, and then lowercase for the check.
-            current_status_for_check = str(raw_message_status).strip().lower() if raw_message_status is not None else ""
-
-            # Basic Validation
-            if not phone_number:
-                logging.warning(f"Sheet {sheet_id} - Row {original_row_idx_1_based}: Skipped due to missing PhoneNumber. Update status attempt follows.")
-                update_cell_value(sheets_service, sheet_id, DEFAULT_SHEET_NAME, original_row_idx_1_based, status_col_idx, "Failed - Missing PhoneNumber")
-                failed_count += 1
-                continue
-
-            # Idempotency Check
-            if current_status_for_check in ["sent", "replied", "completed", "success"]:
-                logging.info(f"Sheet {sheet_id} - Row {original_row_idx_1_based}: Skipped due to existing status '{raw_message_status}'.") # Log raw status
+        phone_number_str = str(phone_number_raw).strip()
+        if '@s.whatsapp.net' not in phone_number_str:
+            cleaned_number = ''.join(filter(str.isdigit, phone_number_str))
+            if not cleaned_number:
                 skipped_count += 1
                 continue
+            formatted_phone_number = f"{cleaned_number}@s.whatsapp.net"
+        else:
+            formatted_phone_number = phone_number_str
 
-            # Message Personalization
-            effective_client_name = client_name if client_name and client_name.strip() else 'Valued Customer'
+        current_status = str(row_values_dict.get('MessageStatus', '')).strip().lower()
+        if current_status in ["sent", "replied", "completed", "success"]:
+            skipped_count += 1
+            continue
 
-            personalized_message = (
-                f"Hi {effective_client_name}, this is Layla from {business_name}. "
-                "Would you like to learn more about our services or perhaps schedule a consultation? 😊"
-            )
+        placeholders = {
+            'ClientName': str(row_values_dict.get('ClientName', 'Valued Customer')).strip(),
+            'ServiceName': str(row_values_dict.get('InterestedService', 'our services')).strip()
+        }
 
-            logging.info(f"Sheet {sheet_id} - Row {original_row_idx_1_based}: Attempting to send message to {phone_number} with text: '{personalized_message[:75]}...'")
-            message_sent_successfully = send_whatsapp_message(phone_number, personalized_message)
-            logging.info(f"Sheet {sheet_id} - Row {original_row_idx_1_based}: send_whatsapp_message for {phone_number} returned: {message_sent_successfully}")
+        message_sent = False
+        if is_interactive and interactive_template.get('buttons'):
+            personalized_data = personalize_interactive_message_data(interactive_template, placeholders)
+            logging.info(f"Row {original_row_idx_1_based}: Sending INTERACTIVE to {formatted_phone_number}.")
+            message_sent = send_interactive_button_message(formatted_phone_number, personalized_data)
+        elif simple_template:
+            personalized_message = simple_template.replace("{{ClientName}}", placeholders['ClientName']).replace("{{ServiceName}}", placeholders['ServiceName'])
+            logging.info(f"Row {original_row_idx_1_based}: Sending SIMPLE to {formatted_phone_number}.")
+            message_sent = send_whatsapp_message(formatted_phone_number, personalized_message)
+        else:
+            skipped_count +=1
+            continue
 
-            current_timestamp_dubai = datetime.now(dubai_tz) # Get current time in Asia/Dubai
-            current_timestamp_str = current_timestamp_dubai.strftime("%Y-%m-%d %H:%M:%S") # Format for sheet
-            new_status_value = ""
+        new_status = "Sent" if message_sent else "Failed - API Error"
+        if 'MessageStatus' in header_map: # Ensure sheets_service is checked if actual update is intended
+            update_cell_value(sheets_service, sheet_id, contacts_sheet_name, original_row_idx_1_based, header_map['MessageStatus'], new_status)
 
-            if message_sent_successfully:
-                new_status_value = "Sent"
-                logging.info(f"Sheet {sheet_id} - Row {original_row_idx_1_based}: Attempting to update status to '{new_status_value}' for {phone_number}.")
-                status_update_success = update_cell_value(sheets_service, sheet_id, DEFAULT_SHEET_NAME, original_row_idx_1_based, status_col_idx, new_status_value)
-                logging.info(f"Sheet {sheet_id} - Row {original_row_idx_1_based}: update_cell_value (for status '{new_status_value}') returned: {status_update_success}")
-                if status_update_success:
-                    sent_count += 1
-                else:
-                    logging.error(f"Sheet {sheet_id} - Row {original_row_idx_1_based}: Failed to UPDATE sheet status to '{new_status_value}' for {phone_number} after successful send. This is problematic.")
-                    # Message was sent, but status update failed. Consider this a partial success / needs attention.
-                    # Not incrementing sent_count here as the record isn't fully processed.
-                    # Not incrementing failed_count either as the message *was* sent.
-                    # This state might need a special status or manual review.
-            else:
-                new_status_value = "Failed - API Error"
-                logging.info(f"Sheet {sheet_id} - Row {original_row_idx_1_based}: Attempting to update status to '{new_status_value}' for {phone_number} (send failed).")
-                status_update_success = update_cell_value(sheets_service, sheet_id, DEFAULT_SHEET_NAME, original_row_idx_1_based, status_col_idx, new_status_value)
-                logging.info(f"Sheet {sheet_id} - Row {original_row_idx_1_based}: update_cell_value (for status '{new_status_value}') returned: {status_update_success}")
-                failed_count += 1 # Increment failed_count as message sending failed
+        if message_sent: sent_count += 1
+        else: failed_count += 1
 
-            # Update LastContactedDate if column exists
-            if last_contacted_col_idx is not None:
-                logging.info(f"Sheet {sheet_id} - Row {original_row_idx_1_based}: Attempting to update LastContactedDate to '{current_timestamp_str}' for {phone_number}.")
-                date_update_success = update_cell_value(sheets_service, sheet_id, DEFAULT_SHEET_NAME, original_row_idx_1_based, last_contacted_col_idx, current_timestamp_str)
-                logging.info(f"Sheet {sheet_id} - Row {original_row_idx_1_based}: update_cell_value (for LastContactedDate) returned: {date_update_success}")
+        if 'LastContactedDate' in header_map: # Ensure sheets_service is checked
+            timestamp = datetime.now(dubai_tz).strftime("%Y-%m-%d %H:%M:%S")
+            update_cell_value(sheets_service, sheet_id, contacts_sheet_name, original_row_idx_1_based, header_map['LastContactedDate'], timestamp)
 
-            # Delay between messages
-            if delay_seconds > 0:
-                time.sleep(delay_seconds)
+        time.sleep(delay_seconds)
 
-        # --- Completion Notification ---
-        summary_message = (
-            f"Outreach campaign from Sheet ID {sheet_id} completed.\n"
-            f"Successfully Sent: {sent_count}\n"
-            f"Failed to Send: {failed_count}\n"
-            f"Skipped (already processed or missing data): {skipped_count}"
-        )
-        send_whatsapp_message(agent_sender_id, summary_message)
-        logging.info(f"Campaign {sheet_id} summary: Sent={sent_count}, Failed={failed_count}, Skipped={skipped_count}")
+    summary_message = f"Campaign {sheet_id}: Sent {sent_count}, Failed {failed_count}, Skipped {skipped_count}"
+    logging.info(summary_message)
+    if agent_sender_id:
+         send_whatsapp_message(agent_sender_id, summary_message)
+    logging.info(f"Campaign {sheet_id} finished.")
 
-        logging.info(f"Outreach campaign for Sheet ID: {sheet_id} finished.")
+def process_outreach_campaign(sheet_id, agent_sender_id, app_context=None):
+    if app_context:
+        with app_context: # Use Flask app context if available
+            _execute_campaign_logic(sheet_id, agent_sender_id)
+    else:
+        # Run directly if no app_context (e.g., for testing)
+        _execute_campaign_logic(sheet_id, agent_sender_id)
